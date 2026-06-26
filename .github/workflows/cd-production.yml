@@ -17,6 +17,8 @@ jobs:
     # Required reviewers configured via GitHub Environments UI
     # Go to: Settings → Environments → production → Required reviewers
     environment: production
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +36,14 @@ jobs:
 
       # --- DATABASE MIGRATIONS ---
       - name: Run Prisma migrations (Production)
-        if: ${{ secrets.DATABASE_URL != '' }}
-        run: pnpm db:migrate
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+        run: pnpm db:migrate
 
       # --- DEPLOY FRONTEND WEB TO VERCEL ---
       - name: Install Vercel CLI
-        run: pnpm add -g vercel
+        run: npm i -g vercel
 
       - name: Pull Vercel Project Info
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
@@ -51,21 +53,61 @@ jobs:
 
       - name: Build Project Artifacts (Vercel)
         run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
 
       - name: Deploy Project Artifacts to Vercel
         run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
-
-      # --- DEPLOY BACKEND API TO RAILWAY/RENDER ---
-      - name: Deploy API to Railway
-        if: ${{ secrets.RAILWAY_TOKEN != '' }}
-        run: |
-          npm i -g @railway/cli
-          railway deploy --service linguoup-api
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
-      - name: Deploy API to Render
-        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+      # --- DEPLOY BACKEND API TO RAILWAY ---
+      # Uses Railway Public API (GraphQL v2) to trigger a deployment from the
+      # current GitHub commit via serviceInstanceDeployV2 (replaces the deprecated
+      # deploymentCreate mutation that was removed from the Railway schema).
+      - name: Deploy API to Railway
+        if: ${{ env.RAILWAY_TOKEN != '' }}
+        env:
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          RAILWAY_ENVIRONMENT_ID: ${{ secrets.RAILWAY_ENVIRONMENT_ID }}
         run: |
-          curl -f "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+          COMMIT_SHA="${{ github.sha }}"
 
+          PAYLOAD=$(cat <<EOF
+          {
+            "query": "mutation serviceInstanceDeployV2(\$serviceId: String!, \$environmentId: String!, \$commitSha: String) { serviceInstanceDeployV2(serviceId: \$serviceId, environmentId: \$environmentId, commitSha: \$commitSha) }",
+            "variables": {
+              "serviceId": "$RAILWAY_SERVICE_ID",
+              "environmentId": "$RAILWAY_ENVIRONMENT_ID",
+              "commitSha": "$COMMIT_SHA"
+            }
+          }
+          EOF
+          )
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST https://backboard.railway.app/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+          echo "Railway API response (HTTP $HTTP_CODE):"
+          echo "$HTTP_BODY"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Railway deployment request failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          if echo "$HTTP_BODY" | grep -q '"errors"'; then
+            echo "❌ Railway API returned errors"
+            exit 1
+          fi
+
+          echo "✅ Railway deployment triggered successfully"
