@@ -27,7 +27,7 @@ jobs:
         with:
           fetch-depth: 0 # Shallow clones disabled for better SonarCloud analysis
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: latest
 
